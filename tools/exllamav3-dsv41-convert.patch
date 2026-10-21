@@ -1,0 +1,469 @@
+diff --git a/exllamav3/architecture/architectures.py b/exllamav3/architecture/architectures.py
+index b0e821fe..c8b2f0f0 100644
+--- a/exllamav3/architecture/architectures.py
++++ b/exllamav3/architecture/architectures.py
+@@ -147,5 +147,9 @@ ARCHITECTURES = {
+     ]
+ }
+ 
++# DeepSeek V4.1 (1017 revision) ships as DeepseekV41ForCausalLM; alias to the V4 entry
++if 'DeepseekV4ForCausalLM' in ARCHITECTURES:
++    ARCHITECTURES['DeepseekV41ForCausalLM'] = ARCHITECTURES['DeepseekV4ForCausalLM']
++
+ def get_architectures():
+     return ARCHITECTURES
+diff --git a/exllamav3/architecture/deepseek_v4.py b/exllamav3/architecture/deepseek_v4.py
+index 5e3a4c48..9a2132fd 100644
+--- a/exllamav3/architecture/deepseek_v4.py
++++ b/exllamav3/architecture/deepseek_v4.py
+@@ -16,7 +16,7 @@ from .deepseek_v4_vision import DeepseekV4VisionModel, read_deepseek_v4_vision_c
+ # Checkpoint uses DeepSeek's native tensor namespace (layers.N.attn.wq_a, hc_attn_fn,
+ # embed / head / norm, ...). Reference implementation: transformers models/deepseek_v4.
+ 
+-_RATIO_TO_TYPE = {0: "sliding", 4: "csa", 128: "hca"}
++_RATIO_TO_TYPE = {0: "sliding", 4: "csa", 128: "hca", 2: "csa", 1: "hca"}  # +1017 ratios (2=csa, 1=hca)
+ 
+ 
+ class DeepseekV4Config(Config):
+@@ -92,6 +92,9 @@ class DeepseekV4Config(Config):
+         self.dspark_noise_token_id = self.read_cfg(int, "dspark_noise_token_id", 0)
+         self.dspark_markov_rank = self.read_cfg(int, "dspark_markov_rank", 256)
+         self.dspark_target_layer_ids = self.read_cfg(list, "dspark_target_layer_ids", [])
++        # MTP drafter may use a smaller expert pool than the trunk (Blackfrost: 128/3 vs 384/6)
++        self.mtp_num_experts = self.read_cfg(int, "dspark_n_routed_experts", self.num_experts)
++        self.mtp_num_experts_per_tok = self.read_cfg(int, "dspark_num_experts_per_tok", self.num_experts_per_tok)
+         # Generator drafter convention (dflash flow): block_size counts the seed position
+         self.block_size = self.dspark_block_size + 1
+         if ratios is not None and len(ratios) > self.num_hidden_layers:
+diff --git a/exllamav3/architecture/deepseek_v4_mtp.py b/exllamav3/architecture/deepseek_v4_mtp.py
+index 4fc1d638..c959588f 100644
+--- a/exllamav3/architecture/deepseek_v4_mtp.py
++++ b/exllamav3/architecture/deepseek_v4_mtp.py
+@@ -94,8 +94,8 @@ class DeepseekV4MTPModel(Model):
+                 key = f"{key}.ffn",
+                 hidden_size = h,
+                 intermediate_size = config.moe_intermediate_size,
+-                num_experts = config.num_experts,
+-                num_experts_per_tok = config.num_experts_per_tok,
++                num_experts = config.mtp_num_experts,
++                num_experts_per_tok = config.mtp_num_experts_per_tok,
+                 key_up = "experts.{expert_idx}.w3",
+                 key_gate = "experts.{expert_idx}.w1",
+                 key_down = "experts.{expert_idx}.w2",
+@@ -175,7 +175,7 @@ class DeepseekV4MTPModel(Model):
+         # head (per-position draft-length score), unquantized
+         self.markov_w1 = Embedding(
+             config = config,
+-            key = f"{last}.markov_head.markov_w1",
++            key = f"{last}.markov_head.embed",  # Blackfrost ckpt naming (DSparkMarkovHead.embed)
+             vocab_size = config.vocab_size,
+             hidden_size = config.dspark_markov_rank,
+             allow_table = False,
+@@ -184,7 +184,7 @@ class DeepseekV4MTPModel(Model):
+         self.markov_w1.caps["prefer_cpu"] = False
+         self.markov_w2 = Linear(
+             config = config,
+-            key = f"{last}.markov_head.markov_w2",
++            key = f"{last}.markov_head.head",  # Blackfrost ckpt naming (DSparkMarkovHead.head)
+             in_features = config.dspark_markov_rank,
+             out_features = config.vocab_size,
+             qmap = None,
+diff --git a/exllamav3/model/config.py b/exllamav3/model/config.py
+index a8ce4281..db235434 100644
+--- a/exllamav3/model/config.py
++++ b/exllamav3/model/config.py
+@@ -135,6 +135,7 @@ class Config(ABC):
+             f"Multiple architectures defined in {self.config_filename}"
+ 
+         arch = self.config_dict["architectures"][0]
++        if arch == "DeepseekV41ForCausalLM" and self.arch_string == "DeepseekV4ForCausalLM": arch = self.arch_string
+         assert arch == self.arch_string, \
+             f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
+         self.architecture = arch
+diff --git a/exllamav3/modules/block_sparse_mlp.py b/exllamav3/modules/block_sparse_mlp.py
+index 5bc01473..1611ca5c 100644
+--- a/exllamav3/modules/block_sparse_mlp.py
++++ b/exllamav3/modules/block_sparse_mlp.py
+@@ -1065,9 +1065,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+             )
+             self.e_score_bias_vl = esb_vl.float() if esb_vl is not None else None
+         if self.tid2eid_key:
++            # 1017 revision may not ship tid2eid; treat as optional
+             self.tid2eid = self.config.stc.get_tensor(
+                 f"{self.key}.{self.tid2eid_key}",
+                 self.device,
++                optional = True,
+                 no_defer = True,
+             )
+         if self.per_expert_scale_key:
+diff --git a/exllamav3/modules/dsv4.py b/exllamav3/modules/dsv4.py
+index 7321c489..a3e2841c 100644
+--- a/exllamav3/modules/dsv4.py
++++ b/exllamav3/modules/dsv4.py
+@@ -127,10 +127,18 @@ class DSV4Compressor:
+             cfg, f"{key}.wkv", attn.hidden_size, proj_width, qmap = qmap, out_dtype = torch.half, trim_padded_out = True,
+             select_hq_bits = select_hq_bits,
+         )
+-        self.wgate = wgate if wgate is not None else Linear(
+-            cfg, f"{key}.wgate", attn.hidden_size, proj_width, qmap = qmap, out_dtype = torch.half, trim_padded_out = True,
+-            select_hq_bits = select_hq_bits,
+-        )
++        # wgate_optional_patch: ratio-1 HCA compressors (Blackfrost / 1017 kv_source layers)
++        # ship only wkv + norm; a missing gate is treated as a uniform (zero) gate.
++        stc = getattr(cfg, "stc", None)
++        if wgate is not None:
++            self.wgate = wgate
++        elif stc is not None and not (stc.has_tensor(f"{key}.wgate.weight") or stc.has_tensor(f"{key}.wgate.trellis")):
++            self.wgate = None
++        else:
++            self.wgate = Linear(
++                cfg, f"{key}.wgate", attn.hidden_size, proj_width, qmap = qmap, out_dtype = torch.half, trim_padded_out = True,
++                select_hq_bits = select_hq_bits,
++            )
+         self.norm = norm if norm is not None else RMSNorm(cfg, f"{key}.norm", attn.rms_norm_eps)
+         self.ape = None  # (compress_rate, proj_width) fp32, loaded by DSV4Attention.load
+         self.bc = None   # BC_DSV4Compressor companion (cached path), built lazily
+@@ -157,6 +165,9 @@ class DSV4Compressor:
+         self.fused_norm_w = self.norm.weight.data
+         if self.fused_norm_w.dtype != torch.half:
+             self.fused_norm_w = self.fused_norm_w.half().contiguous()
++        if self.wgate is None:
++            # gateless compressor: python fallback path (zero gate)
++            return
+         wkv_i, wgate_i = self.wkv.inner, self.wgate.inner
+         if (
+             self.wkv.out_features != self.wkv.out_features_unpadded or
+@@ -237,7 +248,7 @@ class DSV4Compressor:
+                         pool_bt, pool_epp, stage_rel)
+         else:
+             kv = self.wkv.forward(x, params)[0]
+-            gate = self.wgate.forward(x, params)[0]
++            gate = self.wgate.forward(x, params)[0] if self.wgate is not None else torch.zeros_like(kv)
+             ext.dsv4_compress(
+                 kv, gate, buf_kv, buf_gate, ovl, self.ape, self.fused_norm_w,
+                 self.norm.rms_norm_eps, self.fused_inv_freq, dest_a, dest_b, position,
+@@ -253,7 +264,7 @@ class DSV4Compressor:
+         bsz, seq, _ = x.shape
+         m = self.compress_rate
+         kv_new = self.wkv.forward(x, params).float()
+-        gate_new = self.wgate.forward(x, params).float()
++        gate_new = self.wgate.forward(x, params).float() if self.wgate is not None else torch.zeros_like(kv_new)
+         kv, gate = kv_new, gate_new
+         fwp = 0
+         if state is not None:
+@@ -298,7 +309,7 @@ class DSV4Compressor:
+ 
+ 
+     def modules(self):
+-        return [self.wkv, self.wgate, self.norm]
++        return [m for m in (self.wkv, self.wgate, self.norm) if m is not None]
+ 
+ 
+     def tp_export(self, plan, producer):
+@@ -311,7 +322,7 @@ class DSV4Compressor:
+                 "overlapping": self.overlapping,
+             },
+             "wkv": self.wkv.tp_export(plan, producer),
+-            "wgate": self.wgate.tp_export(plan, producer),
++            "wgate": self.wgate.tp_export(plan, producer) if self.wgate is not None else None,
+             "norm": self.norm.tp_export(plan, producer),
+             "ape": producer.send(self.ape),
+         }
+@@ -322,6 +333,8 @@ class DSV4Compressor:
+         consumer = local_context["consumer"]
+         def _imp(name):
+             e = exported[name]
++            if e is None:
++                return None
+             return e["cls"].tp_import(local_context, e, plan)
+         comp = DSV4Compressor(
+             attn,
+@@ -504,48 +517,60 @@ class DSV4Attention(Module):
+         self.idx_wq_b = idx_wq_b
+         self.idx_weights = idx_weights
+         if layer_type in ("csa", "hca") and not tp_defer_compressors:
+-            self.compressor = DSV4Compressor(
+-                self,
+-                f"{key}.compressor",
+-                head_dim,
+-                compress_rate,
+-                overlapping = (layer_type == "csa"),
+-                qmap = qmap,
+-                select_hq_bits = select_hq_bits
+-            )
++            ck = f"{key}.compressor"
++            if self.config.stc.has_tensor(f"{ck}.wkv.weight") or self.config.stc.has_tensor(f"{ck}.wkv.trellis"):
++                self.compressor = DSV4Compressor(
++                    self,
++                    ck,
++                    head_dim,
++                    compress_rate,
++                    overlapping = (layer_type == "csa"),
++                    qmap = qmap,
++                    select_hq_bits = select_hq_bits
++                )
++            else:
++                self.compressor = None
+         if layer_type == "csa" and not tp_defer_compressors:
+-            self.indexer = DSV4Compressor(
+-                self,
+-                f"{key}.indexer.compressor",
+-                index_head_dim,
+-                compress_rate,
+-                overlapping = True,
+-                qmap = qmap,
+-                select_hq_bits = select_hq_bits
+-            )
++            # 1017 / Flash checkpoints have indexer.wk + indexer.wq_b, not a nested
++            # indexer.compressor.{wkv,wgate} (Mia EXL3 2.9 is the same). Skip when absent
++            # or convert dies at the first CSA layer (layers.2).
++            idx_comp_key = f"{key}.indexer.compressor"
++            if self.config.stc.has_tensor(f"{idx_comp_key}.wkv.weight") or self.config.stc.has_tensor(f"{idx_comp_key}.wkv.trellis"):
++                self.indexer = DSV4Compressor(
++                    self,
++                    idx_comp_key,
++                    index_head_dim,
++                    compress_rate,
++                    overlapping = True,
++                    qmap = qmap,
++                    select_hq_bits = select_hq_bits
++                )
++            else:
++                self.indexer = None
+         if layer_type == "csa" and self.idx_wq_b is None:
+-            self.idx_wq_b = Linear(
+-                config,
+-                f"{key}.indexer.wq_b",
+-                q_lora_rank,
+-                index_n_heads * index_head_dim,
+-                qmap = f"{key}.q_b",
+-                out_dtype = torch.half,
+-                qbits_key = qbits_key,
+-                trim_padded_out = True,
+-                select_hq_bits = select_hq_bits,
+-            )
++            if self.config.stc.has_tensor(f"{key}.indexer.wq_b.weight") or self.config.stc.has_tensor(f"{key}.indexer.wq_b.trellis"):
++                self.idx_wq_b = Linear(
++                    config,
++                    f"{key}.indexer.wq_b",
++                    q_lora_rank,
++                    index_n_heads * index_head_dim,
++                    qmap = f"{key}.q_b",
++                    out_dtype = torch.half,
++                    qbits_key = qbits_key,
++                    trim_padded_out = True,
++                    select_hq_bits = select_hq_bits,
++                )
+ 
+-            # Router-like scoring head: 4096 -> 64 (one logit per indexer head), unquantized
+-            self.idx_weights = Linear(
+-                config,
+-                f"{key}.indexer.weights_proj",
+-                hidden_size,
+-                index_n_heads,
+-                qmap = None,
+-                out_dtype = torch.half,
+-                pad_to = 1,
+-            )
++                # Router-like scoring head: 4096 -> 64 (one logit per indexer head), unquantized
++                self.idx_weights = Linear(
++                    config,
++                    f"{key}.indexer.weights_proj",
++                    hidden_size,
++                    index_n_heads,
++                    qmap = None,
++                    out_dtype = torch.half,
++                    pad_to = 1,
++                )
+ 
+         for m in [
+             self.q_a,
+@@ -558,7 +583,8 @@ class DSV4Attention(Module):
+             self.idx_wq_b,
+             self.idx_weights
+         ]:
+-            self.register_submodule(m)
++            if m is not None:
++                self.register_submodule(m)
+ 
+         for comp in [
+             self.compressor,
+@@ -629,12 +655,19 @@ class DSV4Attention(Module):
+         self.kv_norm_w = self.kv_norm.weight.data
+         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
+ 
++        def _load_ape(comp):
++            ape = stc.get_tensor(f"{comp.key}.ape", device, optional = True, no_defer = True, arena = False)
++            if ape is None:
++                # 1017 FP8 / Mia EXL3 have no compressor.ape; zeros match (compress_rate, proj_width)
++                pw = (2 * comp.head_dim) if comp.overlapping else comp.head_dim
++                ape = torch.zeros((comp.compress_rate, pw), dtype = torch.float32, device = device)
++            return ape.float().contiguous()
+         if self.compressor is not None:
+-            self.compressor.ape = stc.get_tensor(f"{self.compressor.key}.ape", device, no_defer = True, arena = False).float().contiguous()
++            self.compressor.ape = _load_ape(self.compressor)
+             self.compressor.make_bc(self.inv_freq_compress)
+         if self.indexer is not None:
+             self.indexer.make_bc(self.inv_freq_compress)
+-            self.indexer.ape = stc.get_tensor(f"{self.indexer.key}.ape", device, no_defer = True, arena = False).float().contiguous()
++            self.indexer.ape = _load_ape(self.indexer)
+         for rl in self.recurrent_layers:
+             rl.alloc(device)
+         for cl in self.cache_layers:
+@@ -711,7 +744,7 @@ class DSV4Attention(Module):
+                 storage_dev += l.storage_size()
+         for comp in (self.compressor, self.indexer):
+             if comp is not None:
+-                storage_dev += comp.wkv.storage_size() + comp.wgate.storage_size()
++                storage_dev += comp.wkv.storage_size() + (comp.wgate.storage_size() if comp.wgate is not None else 0)
+         for rl in self.recurrent_layers:
+             storage_dev += rl.storage_size()
+         for cl in self.cache_layers:
+@@ -964,7 +997,7 @@ class DSV4Attention(Module):
+         if self.indexer is not None:
+             self.indexer._build_fused() if not self.indexer.fused_ready else None
+             lins += [self.indexer.wkv, self.indexer.wgate]
+-        self.x_fan = mk_fan(lins)
++        self.x_fan = mk_fan(lins) if all(l is not None for l in lins) else None
+         self.q_fan = mk_fan([self.q_b, self.idx_wq_b]) if self.indexer is not None else None
+         self._fan_scratch = {}
+ 
+@@ -1138,7 +1171,7 @@ class DSV4Attention(Module):
+                 # the HF cache = None reference; causal bounds use the absolute positions
+                 self.compressor.forward_fused(
+                     x[b:b + 1], params, ring_kv, ring_gate, ovl, pool_c, pool_r, 0)
+-                if self.layer_type == "csa":
++                if self.layer_type == "csa" and self.indexer is not None:
+                     idx_hd = self.index_head_dim
+                     pool_idx = g_tensor_cache.get(device, (max(T, 1), idx_hd), torch.half, "dsv4_nc_pool_idx")
+                     iring_kv = g_tensor_cache.get(device, (rows, self.indexer.wkv.out_features_unpadded), torch.half, "dsv4_nc_iring_kv")
+@@ -1516,12 +1549,12 @@ class DSV4Attention(Module):
+                 if not self.compressor.fused_ready:
+                     self.compressor._build_fused()
+                 comp_kv = self.compressor.wkv.forward(xf, params)[0]
+-                comp_gate = self.compressor.wgate.forward(xf, params)[0]
++                comp_gate = self.compressor.wgate.forward(xf, params)[0] if self.compressor.wgate is not None else torch.zeros_like(comp_kv)
+             if self.indexer is not None:
+                 if not self.indexer.fused_ready:
+                     self.indexer._build_fused()
+                 idx_kv = self.indexer.wkv.forward(xf, params)[0]
+-                idx_gate = self.indexer.wgate.forward(xf, params)[0]
++                idx_gate = self.indexer.wgate.forward(xf, params)[0] if self.indexer.wgate is not None else torch.zeros_like(idx_kv)
+ 
+         if need_q_idx and self.q_fan is not None and rows <= 32:
+             f2 = self.q_fan
+diff --git a/exllamav3/modules/hyperconnections.py b/exllamav3/modules/hyperconnections.py
+index 27357c65..8db9bc50 100644
+--- a/exllamav3/modules/hyperconnections.py
++++ b/exllamav3/modules/hyperconnections.py
+@@ -227,11 +227,37 @@ class HyperConnection(Module):
+                 fn = self.fn_h
+             else:
+                 fn = self.fn
+-            ext.hc_mix(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
+-                       self.sinkhorn_iters, partials, post, comb, collapsed)
+-            return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
++            try:
++                ext.hc_mix(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
++                           self.sinkhorn_iters, partials, post, comb, collapsed)
++                return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
++            except RuntimeError as e:
++                if "invalid argument" not in str(e):
++                    raise
++                # GB10/SM120 kernel rejects the launch; fall through to pure torch
++                self._hc_kernel_failed = True
++        self._hc_kernel_failed = True
++        if getattr(self, '_hc_kernel_failed', False):
++            flat = self.norm.forward(streams.flatten(2), params)
++            mix = F.linear(flat.float(), self.fn.float())
++            hc = self.hc_mult
++            pre_w, post_w, comb_w = mix.split([hc, hc, hc * hc], dim = -1)
++            pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
++            pre_s, post_s, comb_s = self.scale.unbind(0)
++            pre = torch.sigmoid(pre_w * pre_s + pre_b) + self.hc_eps
++            post = 2.0 * torch.sigmoid(post_w * post_s + post_b)
++            comb = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_s + comb_b.view(hc, hc)
++            comb = torch.softmax(comb, dim = -1) + self.hc_eps
++            comb = comb / (comb.sum(dim = -2, keepdim = True) + self.hc_eps)
++            for _ in range(self.sinkhorn_iters - 1):
++                comb = comb / (comb.sum(dim = -1, keepdim = True) + self.hc_eps)
++                comb = comb / (comb.sum(dim = -2, keepdim = True) + self.hc_eps)
++            collapsed = (pre.unsqueeze(-1) * streams).sum(dim = 2).to(torch.half)
++            return post, comb, collapsed
+         flat = self.norm.forward(streams.flatten(2), params)
+         mix = F.linear(flat, self.fn)
++        # GB10/SM120: the hc_mix CUDA kernel can reject the launch (invalid argument);
++        # fall back to this pure-torch implementation, which is the same math.
+         pre_w, post_w, comb_w = mix.split([hc, hc, hc * hc], dim = -1)
+         pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
+         pre_s, post_s, comb_s = self.scale.unbind(0)
+@@ -750,6 +776,19 @@ class HyperHead(Module):
+         self.fn_h = None
+         self.base = None
+         self.scale = None
++        # hc_head_optional_patch (Blackfrost / DeepSeek-V4.1): the checkpoint ships no hc_head_*
++        # tensors; its reference Transformer.forward collapses the final stream with the last
++        # layer's ffn pre-mix (h = layer.hc_pre(h, pre_mix)). Derive pre from layers.{N-1}.hc_ffn_*
++        # (pre rows = first hc_mult rows of the fn/base split, scale[0]); fall back to a plain mean.
++        self.derive_key = None
++        stc = getattr(config, "stc", None)
++        if not self.mean and stc is not None and not stc.has_tensor(f"{key}_fn"):
++            n = getattr(config, "num_hidden_layers", None)
++            dk = f"layers.{n - 1}.hc_ffn" if n else None
++            if dk is not None and stc.has_tensor(f"{dk}_fn"):
++                self.derive_key = dk
++            else:
++                self.mean = True
+ 
+     def _tensor_names(self):
+         return [f"{self.key}_fn", f"{self.key}_base", f"{self.key}_scale"]
+@@ -760,6 +799,15 @@ class HyperHead(Module):
+         if self.mean:
+             return
+         stc = self.config.stc
++        if self.derive_key is not None:
++            dk, hc = self.derive_key, self.hc_mult
++            fn = stc.get_tensor(f"{dk}_fn", device, no_defer = True, arena = False).float()
++            base = stc.get_tensor(f"{dk}_base", device, no_defer = True, arena = False).float()
++            scale = stc.get_tensor(f"{dk}_scale", device, no_defer = True, arena = False).float()
++            self.fn = fn[:hc].contiguous()
++            self.base = base[:hc].contiguous()
++            self.scale = scale.reshape(-1)[0:1].contiguous()
++            return
+         self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True, arena = False).float().contiguous()
+         self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True, arena = False).float().contiguous()
+         self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True, arena = False).float().contiguous()
+@@ -771,7 +819,7 @@ class HyperHead(Module):
+ 
+     @override
+     def get_tensors(self):
+-        if self.mean:
++        if self.mean or self.derive_key is not None:
+             return {}
+         return {
+             f"{self.key}_fn": self.fn,
+@@ -784,13 +832,13 @@ class HyperHead(Module):
+     # never matches them and they would be silently dropped from the compiled shards
+     @override
+     def get_compile_sizes(self, stc):
+-        if self.mean:
++        if self.mean or self.derive_key is not None:
+             return []
+         return [stc.get_tensor_size(k) for k in self._tensor_names()]
+ 
+     @override
+     def get_compile_tensors(self, stc):
+-        if self.mean:
++        if self.mean or self.derive_key is not None:
+             return {}
+         return {k: stc.get_tensor(k, allow_bf16 = True) for k in self._tensor_names()}
+ 
+@@ -837,7 +885,7 @@ class HyperHead(Module):
+         if self.mean:
+             return x.mean(dim = 2)
+         b, s, H, D = x.shape
+-        if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
++        if self.derive_key is None and H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
+             R = b * s
+             chunks = ext.hc_mix_num_chunks(R, H * D)
+             # Decode-class row counts take the static workspaces (same rule as _mix); prefill
